@@ -1,0 +1,121 @@
+diff --git a/adbfs.cpp b/adbfs.cpp
+index edadc93..018e535 100644
+--- a/adbfs.cpp
++++ b/adbfs.cpp
+@@ -80,6 +80,7 @@
+ #include <signal.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
++#include <sys/statvfs.h>
+ #include <pwd.h>
+ #include <grp.h>
+ 
+@@ -650,6 +651,99 @@ static int adb_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+ }
+ 
+ 
++static bool str_all_digits(const string& s) {
++    if (s.empty()) return false;
++    for (size_t i = 0; i < s.size(); ++i)
++        if (!isdigit((unsigned char)s[i])) return false;
++    return true;
++}
++
++/*
++   adbFS implementation of fuse_operations.statfs.
++
++   Added for DroidMount: without this the mounted volume reports 0 bytes free, so
++   Finder/NFS refuse any copy *into* the phone with "not enough space available".
++   We report /sdcard's real free/total space by parsing `df -k /sdcard` on the device.
++   macOS calls statfs on the mount root (device "/"), whose filesystem is Android's
++   tiny, always-full root partition — useless and misleading. The writable area this
++   tool exists for is /sdcard, so we always report that. Columns are:
++   Filesystem 1K-blocks Used Available [Use%] Mounted-on, so the numeric tokens are
++   [total, used, available]; df -k blocks are 1 KiB.
++ */
++static int adb_statfs(const char *path, struct statvfs *stbuf) {
++    (void)path;   // always report /sdcard, regardless of which path was queried
++    memset(stbuf, 0, sizeof(struct statvfs));
++
++    queue<string> output = adb_shell("df -k /sdcard");
++
++    unsigned long long total_k = 0, avail_k = 0;
++    while (!output.empty()) {
++        string line = output.front(); output.pop();
++        vector<string> cols = make_array(line);
++        vector<unsigned long long> nums;
++        for (size_t i = 0; i < cols.size(); ++i) {
++            string t = cols[i];
++            if (!t.empty() && t[t.size() - 1] == '%') t = t.substr(0, t.size() - 1);
++            if (str_all_digits(t)) nums.push_back(strtoull(t.c_str(), NULL, 10));
++        }
++        if (nums.size() >= 3) { total_k = nums[0]; avail_k = nums[2]; break; }
++    }
++
++    if (total_k == 0) {
++        // Couldn't parse df: advertise a large volume so writes aren't blocked.
++        total_k = 64ULL * 1024 * 1024;   // 64 GiB
++        avail_k = 32ULL * 1024 * 1024;   // 32 GiB
++    }
++
++    stbuf->f_bsize   = 1024;             // df -k => 1 KiB blocks
++    stbuf->f_frsize  = 1024;
++    stbuf->f_blocks  = (fsblkcnt_t)total_k;
++    stbuf->f_bfree   = (fsblkcnt_t)avail_k;
++    stbuf->f_bavail  = (fsblkcnt_t)avail_k;
++    stbuf->f_namemax = 255;
++    return 0;
++}
++
++/*
++   adbFS implementation of fuse_operations.create.
++
++   Added for FUSE-T compatibility (DroidMount): FUSE-T's NFS backend issues a
++   `create` call for new files instead of synthesizing it from mknod+open the
++   way macFUSE does. Without this, opening a non-existent file for write fell
++   through adb_open's "file not found" path and returned -ENOENT (surfaced to
++   the user as EACCES). Here we create the local temp file, hand back its fd,
++   and push an empty file so it exists on the device immediately; subsequent
++   writes go to fi->fh and adb_flush pushes the final contents.
++ */
++static int adb_create(const char *path, mode_t mode, struct fuse_file_info *fi)
++{
++    string path_string;
++    string local_path_string;
++    path_string.assign(path);
++    local_path_string = tempDirPath;
++    string_replacer(path_string,"/","-");
++    local_path_string.append(path_string);
++    path_string.assign(path);
++
++    string filehandle_path = local_path_string;
++
++    // Create (or truncate) the local backing file and keep it open for writes.
++    int fd = open(filehandle_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, mode | S_IRUSR | S_IWUSR);
++    if (fd == -1)
++        return -errno;
++    fi->fh = fd;
++    filePendingWrite[fd] = true;
++
++    // Make the file exist on the device now (empty); flush will push contents.
++    shell_escape_path(path_string);
++    shell_escape_path(local_path_string);
++    adb_push(local_path_string, path_string);
++    adb_shell("sync");
++    invalidateCache(path_string);
++
++    return 0;
++}
++
+ static int adb_open(const char *path, struct fuse_file_info *fi)
+ {
+     string path_string;
+@@ -1102,6 +1196,8 @@ int main(int argc, char *argv[])
+     adbfs_oper.getattr= adb_getattr;
+     adbfs_oper.access= adb_access;
+     adbfs_oper.open= adb_open;
++    adbfs_oper.create = adb_create;
++    adbfs_oper.statfs = adb_statfs;
+     adbfs_oper.flush = adb_flush;
+     adbfs_oper.release = adb_release;
+     adbfs_oper.read= adb_read;

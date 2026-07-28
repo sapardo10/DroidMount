@@ -4,6 +4,11 @@ A free macOS menu-bar app that mounts your Android phone as a Finder drive with
 **full read / write / delete / rename** — the things MacDroid puts behind its PRO
 paywall. Connects over **ADB**, mounts via **FUSE-T** (no kernel extension required).
 
+**[Download the latest release](https://github.com/sapardo10/DroidMount/releases/latest)**
+— unzip and see [One-time setup](#one-time-setup) below. No build tools required if
+you use the prebuilt app; the manual build steps are only needed if you want to
+build from source.
+
 ## How it works
 
 ```

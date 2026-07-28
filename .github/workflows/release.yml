@@ -1,0 +1,53 @@
+name: Release
+
+# Builds DroidMount.app on every push to main and publishes it as a downloadable
+# GitHub Release. The release version comes from the VERSION file — bump that file
+# in a commit when you want a new numbered release; pushes with an unchanged
+# VERSION just update the existing release's asset.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        run: |
+          brew install pkg-config
+          brew install --cask macos-fuse-t/homebrew-cask/fuse-t
+
+      - name: Build adbfs daemon
+        run: ./build.sh
+
+      - name: Build DroidMount.app
+        run: ./app/build_app.sh
+
+      - name: Zip app bundle
+        run: |
+          cd build
+          ditto -c -k --sequesterRsrc --keepParent DroidMount.app \
+            "../DroidMount-v${{ steps.version.outputs.version }}.zip"
+
+      - name: Create/update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: DroidMount v${{ steps.version.outputs.version }}
+          body: |
+            Unsigned build — first launch requires right-click → Open (Gatekeeper).
+            See the README for one-time setup (FUSE-T + USB debugging).
+          files: DroidMount-v${{ steps.version.outputs.version }}.zip

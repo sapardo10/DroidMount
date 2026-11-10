@@ -17,7 +17,7 @@ final class DeviceMonitor {
     private let lock = NSLock()
     private var generation = 0
 
-    func start(interval: TimeInterval = 3.0) {
+    func start(interval: TimeInterval = 2.0) {
         poll()
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.poll()

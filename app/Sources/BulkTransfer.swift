@@ -6,8 +6,9 @@ import AppKit
 /// files (→ push to phone).
 ///
 /// Items are grouped into batches (≤ `batchSize`) so one `adb` call copies many files
-/// at once instead of spawning a process per file — the per-file spawn + stat storm is
-/// what made the old per-item path ~60× slower for many small files.
+/// at once, and up to `maxConcurrent` batches run in parallel. Progress comes from
+/// adb's own per-file stderr lines (`<path>: 1 file pulled/pushed, ...`), which
+/// arrive as each file completes — no extra adb calls and no polling sleep.
 final class BulkTransfer {
     enum Direction { case phoneToMac, macToPhone }
 
@@ -19,8 +20,14 @@ final class BulkTransfer {
     }
 
     /// Files copied per `adb` invocation. Big enough to amortize the process
-    /// spawn, small enough to keep argv and progress granularity reasonable.
+    /// spawn, small enough to keep argv and error granularity reasonable.
     static let batchSize = 16
+
+    /// Batches (adb calls) allowed in flight at once. Each opens its own
+    /// connection to the device; running several at once overlaps per-call
+    /// setup with transfer and keeps the link busy. Bandwidth-bound single
+    /// huge files see no change; many-file jobs see the biggest win.
+    static let maxConcurrent = 4
 
     struct Item {
         let path: String            // source path (device-absolute or local POSIX)
@@ -31,7 +38,8 @@ final class BulkTransfer {
     let serial: String
     let mountPoint: String
 
-    private var current: Process?
+    private let lock = NSLock()
+    private var activeProcesses: [Process] = []
     private(set) var cancelled = false
 
     init?(serial: String) {
@@ -89,8 +97,10 @@ final class BulkTransfer {
     // MARK: - Transfer
 
     /// Run a transfer. `progress` receives CUMULATIVE counts: `bytes` is everything
-    /// copied so far (including finished batches) against the grand `totalBytes`, so
-    /// the bar fills monotonically across the whole job. `done`/`total` count items.
+    /// copied so far (finished batches plus in-flight partials) against the grand
+    /// `totalBytes`, so the bar fills monotonically across the whole job.
+    /// `done`/`total` count items (batches complete out of order under
+    /// parallelism, so `done` jumps in batch-sized steps).
     func run(direction: Direction,
              items: [String],
              destination: String,
@@ -134,27 +144,111 @@ final class BulkTransfer {
                 }
             }
 
-            var done = 0
-            var completedBytes: Int64 = 0
+            let batches = Self.chunk(items, size: Self.batchSize)
 
-            for batch in Self.chunk(items, size: Self.batchSize) {
-                if self.cancelled { completion(nil); return }
-                let label = self.batchLabel(for: batch)
-                let (ok, error, copied) = self.runBatch(
-                    direction, batch, destination: destination) { bytes in
-                        progress(done, total, label, completedBytes + bytes,
-                                 grandTotal > 0 ? grandTotal : nil)
-                    }
-                if self.cancelled { completion(nil); return }
-                guard ok else {
-                    completion(error)
-                    return
+            // Shared job state; all fields read/written under self.lock.
+            var next = 0                  // next batch index to start
+            var inFlight = 0              // started, not yet finished
+            var doneItems = 0
+            var completedBytes: Int64 = 0
+            var inflightBytes: Int64 = 0  // partial bytes of running batches
+            var firstError: String? = nil
+            var lastEmit = Date.distantPast
+            var lastLabel = ""
+            var finished = false
+
+            func emit(_ force: Bool) {
+                self.lock.lock()
+                if finished { self.lock.unlock(); return }
+                let bytes = completedBytes + inflightBytes
+                let now = Date()
+                if !force, now.timeIntervalSince(lastEmit) < 0.25 {
+                    self.lock.unlock(); return
                 }
-                done += batch.count
-                completedBytes += copied
-                progress(done, total, "", completedBytes, grandTotal > 0 ? grandTotal : nil)
+                lastEmit = now
+                let (label, done) = (lastLabel, doneItems)
+                self.lock.unlock()
+                progress(done, total, label, bytes, grandTotal > 0 ? grandTotal : nil)
             }
-            completion(nil)
+
+            let group = DispatchGroup()
+            for _ in 0..<min(Self.maxConcurrent, max(batches.count, 1)) {
+                group.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    while true {
+                        // Claim the next batch (or observe that nothing is left).
+                        let idx: Int
+                        self.lock.lock()
+                        if self.cancelled || firstError != nil {
+                            idx = -1                       // stop starting new work
+                        } else if next < batches.count {
+                            idx = next; next += 1
+                            lastLabel = self.batchLabel(for: batches[idx])
+                        } else {
+                            idx = -1
+                        }
+                        self.lock.unlock()
+
+                        if idx < 0 {
+                            self.lock.lock()
+                            let drained = inFlight == 0
+                            self.lock.unlock()
+                            if drained { break }
+                            Thread.sleep(forTimeInterval: 0.05)
+                            continue
+                        }
+
+                        self.lock.lock()
+                        inFlight += 1
+                        self.lock.unlock()
+
+                        var lastPolled: Int64 = 0
+                        let pollLock = NSLock()   // poll() may come from two threads
+                        let (ok, error, copied) = self.runBatch(
+                            direction, batches[idx], destination: destination) { bytes in
+                            pollLock.lock()
+                            let delta = bytes - lastPolled
+                            lastPolled = bytes
+                            pollLock.unlock()
+                            if delta != 0 {
+                                self.lock.lock()
+                                inflightBytes += delta
+                                self.lock.unlock()
+                                emit(false)
+                            }
+                        }
+
+                        self.lock.lock()
+                        inFlight -= 1
+                        inflightBytes -= lastPolled
+                        if ok {
+                            completedBytes += copied
+                            doneItems += batches[idx].count
+                        }
+                        if !ok, let error, firstError == nil { firstError = error }
+                        self.lock.unlock()
+                        emit(true)
+                    }
+                    group.leave()
+                }
+            }
+            group.wait()
+
+            self.lock.lock()
+            finished = true
+            let finalBytes = completedBytes + inflightBytes
+            let error = firstError
+            self.lock.unlock()
+
+            if self.cancelled {
+                progress(doneItems, total, "", finalBytes, grandTotal > 0 ? grandTotal : nil)
+                completion(nil)
+            } else if let error {
+                completion(error)
+            } else {
+                progress(total, total, "", finalBytes, grandTotal > 0 ? grandTotal : nil)
+                completion(nil)
+            }
         }
     }
 
@@ -163,8 +257,12 @@ final class BulkTransfer {
         return batch.count == 1 ? first : "\(batch.count) items (first: \(first))"
     }
 
-    /// Copy one batch with a single `adb` call, polling byte progress while it runs.
-    /// Returns (ok, errorMessage, bytesCopied). A cancelled transfer returns (false, nil, _).
+    /// Copy one batch with a single `adb` call. Progress derives from adb's
+    /// per-file stderr lines (each `<source>: 1 file pulled/pushed, ...` marks
+    /// that file done) plus a periodic partial measurement (local file sizes
+    /// for pulls — free; one remote stat call per second for pushes).
+    /// Returns (ok, errorMessage, bytesCopied). A cancelled transfer returns
+    /// (false, nil, 0).
     private func runBatch(_ direction: Direction, _ batch: [Item], destination: String,
                           poll: @escaping (Int64) -> Void) -> (Bool, String?, Int64) {
         let p = Process()
@@ -187,50 +285,108 @@ final class BulkTransfer {
         p.standardError = err
         let errorLock = NSLock()
         var errorData = Data()
-        let errorRead = DispatchGroup()
-        errorRead.enter()
+        let done = DispatchGroup()
+
+        // Incremental stderr reader: accumulates the full output (for error
+        // messages) and parses per-file completion lines as they arrive.
+        let progressLock = NSLock()
+        var lineBuffer = Data()
+        var eventBytes: Int64 = 0
+        var completedSources = Set<String>()
+        let sizeBySource = Dictionary(uniqueKeysWithValues:
+            batch.map { ($0.path, $0.totalBytes ?? 0) })
+
+        done.enter()
         DispatchQueue.global(qos: .utility).async {
-            let data = err.fileHandleForReading.readDataToEndOfFile()
-            errorLock.lock()
-            errorData = data
-            errorLock.unlock()
-            errorRead.leave()
+            let handle = err.fileHandleForReading
+            while true {
+                let chunk = handle.availableData
+                if chunk.isEmpty { break }   // EOF
+                errorLock.lock()
+                errorData.append(chunk)
+                errorLock.unlock()
+
+                progressLock.lock()
+                lineBuffer.append(chunk)
+                var lines: [String] = []
+                while let nl = lineBuffer.firstIndex(of: 0x0A) {
+                    let lineData = lineBuffer.subdata(in: lineBuffer.startIndex..<nl)
+                    lineBuffer.removeSubrange(lineBuffer.startIndex...nl)
+                    if let s = String(data: lineData, encoding: .utf8) {
+                        lines.append(s)
+                    }
+                }
+                var gained: Int64 = 0
+                for line in lines {
+                    for source in batch.map(\.path) where !completedSources.contains(source) {
+                        if line.hasPrefix(source + ": "),
+                           line.contains("1 file ") || line.contains("file ") {
+                            completedSources.insert(source)
+                            gained += sizeBySource[source] ?? 0
+                            break
+                        }
+                    }
+                }
+                if gained != 0 { eventBytes += gained }
+                let totalBytes = eventBytes
+                progressLock.unlock()
+
+                if gained != 0 { poll(totalBytes) }
+            }
+            done.leave()
         }
+
         do { try p.run() } catch {
             err.fileHandleForReading.closeFile()
             return (false, "Failed to launch adb: \(error.localizedDescription)", 0)
         }
-        self.current = p
+        lock.lock()
+        activeProcesses.append(p)
+        lock.unlock()
+        defer {
+            lock.lock()
+            activeProcesses.removeAll { $0 === p }
+            lock.unlock()
+        }
 
+        // Wait for exit on a fine-grained loop (0.1 s), measuring partial
+        // progress at a slower cadence so the work is worth doing.
+        let measureInterval: TimeInterval = (direction == .macToPhone) ? 1.0 : 0.5
+        var lastMeasure = Date()
         while p.isRunning {
-            Thread.sleep(forTimeInterval: 0.5)
+            Thread.sleep(forTimeInterval: 0.1)
             if self.cancelled {
                 p.terminate()
                 let deadline = Date().addingTimeInterval(2)
                 while p.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.1) }
                 break
             }
-            let bytes: Int64
+            guard Date().timeIntervalSince(lastMeasure) >= measureInterval else { continue }
+            lastMeasure = Date()
+
+            var partial: Int64 = 0
             switch direction {
             case .phoneToMac:
-                // adb pull writes the local target incrementally — measure it locally.
-                bytes = zip(batch, targets).reduce(Int64(0)) { acc, pair in
+                // adb pull writes the local target incrementally — measure locally.
+                partial = zip(batch, targets).reduce(Int64(0)) { acc, pair in
                     let measured = self.localSize(pair.1) ?? 0
                     return acc + min(measured, pair.0.totalBytes ?? measured)
                 }
             case .macToPhone:
                 // Measure on the phone — one adb call sizes the whole batch.
                 let sizes = self.remoteSizes(targets)
-                bytes = zip(batch, sizes).reduce(Int64(0)) { acc, pair in
+                partial = zip(batch, sizes).reduce(Int64(0)) { acc, pair in
                     let measured = pair.1 ?? 0
                     return acc + min(measured, pair.0.totalBytes ?? measured)
                 }
             }
-            poll(bytes)
+            progressLock.lock()
+            let events = eventBytes
+            progressLock.unlock()
+            poll(max(events, partial))
         }
         p.waitUntilExit()
-        self.current = nil
-        errorRead.wait()
+        done.wait()
 
         if self.cancelled { return (false, nil, 0) }
         if p.terminationStatus != 0 {
@@ -249,8 +405,11 @@ final class BulkTransfer {
     }
 
     func cancel() {
+        lock.lock()
         cancelled = true
-        current?.terminate()
+        let procs = activeProcesses
+        lock.unlock()
+        procs.forEach { $0.terminate() }
     }
 
     // MARK: - Sizing helpers
@@ -259,20 +418,24 @@ final class BulkTransfer {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    /// Size a list of DEVICE paths, in input order, with as few adb calls as possible
-    /// (chunked by 128 so huge selections stay within argv limits). Files use
-    /// `stat -c %s`, directories use `du -sk` (KB → bytes). Missing paths read 0.
+    /// Size a list of DEVICE paths, in input order, with as few adb calls as
+    /// possible (chunked by 48 so huge selections stay within argv limits). Each
+    /// per-path stat/du runs in a background subshell on the device (`( … ) &` +
+    /// `wait`), so the whole chunk costs about one process spawn instead of one
+    /// per path. Files use `stat -c %s`, directories use `du -sk` (KB → bytes).
+    /// Missing paths read 0.
     func remoteSizes(_ paths: [String]) -> [Int64?] {
         var result: [Int64?] = Array(repeating: nil, count: paths.count)
-        for (offset, chunk) in Self.chunk(paths, size: 128).enumerated() {
-            // Emit "<index> D <kb>" or "<index> F <bytes>" per path, in order, so the
-            // mapping survives paths that don't exist (they still print, with 0).
+        for (offset, chunk) in Self.chunk(paths, size: 48).enumerated() {
+            // Emit "<index> D <kb>" or "<index> F <bytes>" per path (in parallel);
+            // the index keeps the mapping intact for paths that don't exist
+            // (they still print, with 0).
             var script = "i=0; for f in " + chunk.map(shellQuote).joined(separator: " ")
-            script += "; do i=$((i+1)); if [ -d \"$f\" ]; then "
+            script += "; do i=$((i+1)); ( if [ -d \"$f\" ]; then "
             script += "s=$(du -sk \"$f\" 2>/dev/null | awk '{print $1}'); [ -n \"$s\" ] || s=0; "
             script += "echo \"$i D $s\"; else "
             script += "s=$(stat -c %s \"$f\" 2>/dev/null); [ -n \"$s\" ] || s=0; "
-            script += "echo \"$i F $s\"; fi; done"
+            script += "echo \"$i F $s\"; fi ) & done; wait"
             let (status, out) = self.runShell(script)
             guard status == 0 else { continue }
             for line in out.split(whereSeparator: \.isNewline) {

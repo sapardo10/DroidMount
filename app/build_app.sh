@@ -14,6 +14,10 @@ APP="$BUILD/DroidMount.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$APPDIR/Info.plist" "$APP/Contents/Info.plist"
+# Stamp the version from the VERSION file so the bundle matches the release tag.
+VERSION="$(cat "$ROOT/VERSION")"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
 cp "$DAEMON" "$APP/Contents/Resources/adbfs"
 
 echo "Compiling Swift sources…"

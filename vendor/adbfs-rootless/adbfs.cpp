@@ -284,6 +284,58 @@ void shell_escape_path(string &path)
   string_replacer(path, "\"", "\\\"");
 }
 
+// DroidMount (fast browsing): short-TTL cache of `ls -la` directory listings,
+// keyed like fileData (escaped FUSE path). Finder re-lists a directory on
+// focus changes, refreshes and back-navigation; serving those from a 2 s
+// cache makes navigation instant while bounding staleness for changes made
+// outside the mount (camera, media scanner, bulk transfers that bypass the
+// mount). Mutations through the mount invalidate the affected parent
+// immediately (invalidateParentListing).
+static const time_t DIR_LISTING_TTL = 2;
+struct DirListing {
+    vector<string> lines;
+    time_t at;
+};
+static map<string, DirListing> dirListings;
+static mutex dirListingsLock;
+
+static bool dirListingGet(const string& key, vector<string>& lines) {
+    lock_guard<mutex> g(dirListingsLock);
+    map<string, DirListing>::iterator it = dirListings.find(key);
+    if (it == dirListings.end()) return false;
+    if (time(NULL) - it->second.at >= DIR_LISTING_TTL) {
+        dirListings.erase(it);
+        return false;
+    }
+    lines = it->second.lines;
+    return true;
+}
+
+static void dirListingPut(const string& key, const vector<string>& lines) {
+    lock_guard<mutex> g(dirListingsLock);
+    DirListing e;
+    e.lines = lines;
+    e.at = time(NULL);
+    dirListings[key] = e;
+}
+
+// DroidMount (fast browsing): drop the cached listing of the PARENT of a FUSE
+// path so the next readdir re-fetches from the device after a mutation.
+// (The mutated entry's own fileData stat is handled by invalidateCache.)
+static void invalidateParentListing(const string& path) {
+    string parent;
+    if (path.empty() || path == "/") {
+        parent = "/";
+    } else {
+        size_t slash = path.find_last_of('/');
+        parent = (slash == 0) ? "/" : path.substr(0, slash);
+    }
+    string key = parent;
+    shell_escape_path(key);
+    lock_guard<mutex> g(dirListingsLock);
+    dirListings.erase(key);
+}
+
 /**
    Make a secure temporary directory for each mounted filesystem. Use with
    ANDROID_SERIAL environment variable to mount multiple phones at once.
@@ -646,55 +698,67 @@ static int adb_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
     shell_escape_path(path_string);   // cache key: FUSE path
     string dev = devPath(path);
-    shell_escape_path(dev);           // device command: full device path
+    string dev_escaped = dev;
+    shell_escape_path(dev_escaped);   // device command: full device path
 
-    queue<string> output;
-    string command = "ls -l -a '";
-    command.append(dev);
-    command.append("'");
-    output = adb_shell(command);
+    // DroidMount: re-listings within the TTL come from cache (see the
+    // DIR_LISTING_TTL block above). An empty reply means the phone is gone —
+    // don't cache that, or files would vanish from the listing for 2 s.
+    vector<string> lines;
+    if (!dirListingGet(path_string, lines)) {
+        string command = "ls -l -a '";
+        command.append(dev_escaped);
+        command.append("'");
+        queue<string> output = adb_shell(command);
+        if (!output.empty()) {
+            while (!output.empty()) {
+                lines.push_back(output.front());
+                output.pop();
+            }
+            dirListingPut(path_string, lines);
+        }
+    }
 
     /* cannot tell between "no phone" and "empty directory" */
-    cout << "found files: " << output.size() << endl;
-    while (output.size() > 0) {
+    cout << "found files: " << lines.size() << endl;
+    for (size_t li = 0; li < lines.size(); ++li) {
         // skip lines too short to process (should not happen)
-        if (output.front().length() >= 3) {
+        if (lines[li].length() >= 3) {
             // we can get e.g. "permission denied" during listing, need to check every line separately
-            if (!is_valid_ls_output(output.front())) {
+            if (!is_valid_ls_output(lines[li])) {
                 // error format: "lstat '//efs' failed: Permission denied"
                 if (
-                     output.front().length() > sizeof(PERMISSION_ERR_MSG) &&
-                     (!output.front().compare(output.front().length() - sizeof(PERMISSION_ERR_MSG) + 1,
-                                            sizeof(PERMISSION_ERR_MSG) - 1, PERMISSION_ERR_MSG))) {
-                    size_t nameStart = output.front().rfind("/") + 1;
-                    const string& fname_l = output.front().substr(nameStart, output.front().find("' ") - nameStart);
+                     lines[li].length() > sizeof(PERMISSION_ERR_MSG) &&
+                     (!lines[li].compare(lines[li].length() - sizeof(PERMISSION_ERR_MSG) + 1,
+                                        sizeof(PERMISSION_ERR_MSG) - 1, PERMISSION_ERR_MSG))) {
+                    size_t nameStart = lines[li].rfind("/") + 1;
+                    const string& fname_l = lines[li].substr(nameStart, lines[li].find("' ") - nameStart);
                     cout << "Adding file:" << fname_l << ":" << endl;
                     filler(buf, fname_l.c_str(), NULL, 0);
                     const string& path_string_c = path_string
                         + (path_string == "/" ? "" : "/") + fname_l;
 
-                    cout << "caching " << path_string_c << " = " << output.front() <<  endl;
+                    cout << "caching " << path_string_c << " = " << lines[li] <<  endl;
                     fileData[path_string_c].statOutput.erase();
                     fileData[path_string_c].timestamp = time(NULL);
                     cout << "cached " << endl;
                 }
             } else {
                 // Start of filename = `ls -la` time separator + 4
-                size_t nameStart = output.front().find_first_of(":") + 4;
-                const string& fname_l = output.front().substr(nameStart);
+                size_t nameStart = lines[li].find_first_of(":") + 4;
+                const string& fname_l = lines[li].substr(nameStart);
                 const string fname_n = fname_l.substr(0, fname_l.find(" -> "));
                 cout << "Adding file:" << fname_n <<":" << endl;
                 filler(buf, fname_n.c_str(), NULL, 0);
                 const string path_string_c = path_string
                     + (path_string == "/" ? "" : "/") + fname_n;
 
-                cout << "caching " << path_string_c << " = " << output.front() <<  endl;
-                fileData[path_string_c].statOutput = output.front();
+                cout << "caching " << path_string_c << " = " << lines[li] <<  endl;
+                fileData[path_string_c].statOutput = lines[li];
                 fileData[path_string_c].timestamp = time(NULL);
                 cout << "cached " << endl;
             }
         }
-        output.pop();
     }
     cout << "done with found files" << endl;
 
@@ -851,6 +915,7 @@ static int adb_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     adb_push(local_path_string, dev);
     adb_shell("sync");
     invalidateCache(path_string);
+    invalidateParentListing(path);
 
     return 0;
 }
@@ -880,8 +945,23 @@ static int adb_open(const char *path, struct fuse_file_info *fi)
         string command = "ls -l -a -d '";
         command.append(dev_escaped);
         command.append("'");
-        cout << command<<"\n";
-        output = adb_shell(command);
+        // DroidMount (fast browsing): a read-only open may ride on a fresh
+        // cached stat (30 s TTL, populated by readdir/getattr) and skip the
+        // `ls` adb spawn entirely — Finder opens files to inspect/preview
+        // them, and every such open used to cost a device round trip.
+        // Write opens always verify against the device (they pull current
+        // content into the temp file).
+        if ((fi->flags & O_ACCMODE) == O_RDONLY) {
+            map<string,fileCache>::iterator it = fileData.find(path_string);
+            if (it != fileData.end() && !it->second.statOutput.empty()
+                && it->second.timestamp + 30 >= time(NULL)) {
+                output.push(it->second.statOutput);
+            }
+        }
+        if (output.empty()) {
+            cout << command<<"\n";
+            output = adb_shell(command);
+        }
         if (output.empty())
             return -EIO;
         vector<string> output_chunk = make_array(output.front());
@@ -1117,6 +1197,7 @@ static int adb_flush(const char *path, struct fuse_file_info *fi) {
     cout << "flag is: "<< flags <<"\n";
     invalidateCache(path_string);
     if (filePendingWrite[fd]) {
+        invalidateParentListing(path);
         filePendingWrite[fd] = false;
         adb_push(local_path_string, dev_escaped);
         adb_shell("sync");
@@ -1239,6 +1320,10 @@ static int adb_utimens(const char *path, const struct timespec ts[2]) {
     // If we forgot to mount -o rescan then we can remount and touch to trigger the scan.
     if (adbfs_conf.rescan) adb_rescan_file(dev);
 
+    // The listing shows mtime; a changed timestamp makes the cached parent
+    // listing stale.
+    invalidateParentListing(path);
+
     return 0;
 }
 
@@ -1274,6 +1359,7 @@ static int adb_truncate(const char *path, off_t size) {
     fileTruncated[path_string] = true;
 
     invalidateCache(path_string);
+    invalidateParentListing(path);
 
     cout << "truncate[path=" << local_path_string << "][size=" << size << "]" << endl;
 
@@ -1302,6 +1388,7 @@ static int adb_mknod(const char *path, mode_t mode, dev_t rdev) {
     adb_shell("sync");
 
     invalidateCache(path_string);
+    invalidateParentListing(path);
 
     return 0;
 }
@@ -1327,6 +1414,7 @@ static int adb_mkdir(const char *path, mode_t mode) {
     command.append("'");
     adb_shell(command);
     invalidateCache(path_string);
+    invalidateParentListing(path);
     return 0;
 }
 
@@ -1366,6 +1454,8 @@ static int adb_rename(const char *from, const char *to) {
     }
     invalidateCache(string(from));
     invalidateCache(string(to));
+    invalidateParentListing(from);
+    invalidateParentListing(to);
     return 0;
 }
 
@@ -1391,6 +1481,7 @@ static int adb_rmdir(const char *path) {
     adb_shell(command);
     if (adbfs_conf.rescan) adb_rescan_dir_removed(dev);
     invalidateCache(path_string);
+    invalidateParentListing(path);
 
     //rmdir(local_path_string.c_str());
     return 0;
@@ -1418,6 +1509,7 @@ static int adb_unlink(const char *path) {
     adb_shell(command);
     if (adbfs_conf.rescan) adb_rescan_file(dev);
     invalidateCache(path_string);
+    invalidateParentListing(path);
     unlink(local_path_string.c_str());
     return 0;
 }

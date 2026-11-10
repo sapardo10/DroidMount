@@ -1,239 +1,640 @@
 diff --git a/adbfs.cpp b/adbfs.cpp
-index edadc93..018e535 100644
+index d11bf51..021d11f 100644
 --- a/adbfs.cpp
 +++ b/adbfs.cpp
-@@ -80,6 +80,7 @@
- #include <signal.h>
- #include <sys/stat.h>
- #include <sys/types.h>
-+#include <sys/statvfs.h>
+@@ -83,6 +83,8 @@
+ #include <sys/statvfs.h>
  #include <pwd.h>
  #include <grp.h>
-
-@@ -650,6 +651,99 @@ static int adb_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
- }
-
-
-+static bool str_all_digits(const string& s) {
-+    if (s.empty()) return false;
-+    for (size_t i = 0; i < s.size(); ++i)
-+        if (!isdigit((unsigned char)s[i])) return false;
-+    return true;
++#include <mutex>
++#include <memory>
+ 
+ void handler(int sig) {
+   void *array[10];
+@@ -126,21 +128,66 @@ map<int,bool> filePendingWrite;
+ map<string,bool> fileTruncated;
+ bool touch_gnu_mode = true;
+ 
++// DroidMount (lazy-reads): per-open state for read-only opens.
++// Finder/Quick Look open files in a folder just to preview them, so read-only
++// opens no longer adb-pull the whole file up front (see adb_open). Instead we
++// remember the remote size, fetch only the ranges actually read (adb_read),
++// and "upgrade" to a one-shot full pull once the client clearly wants the
++// content. Keyed by the fd we hand back in fi->fh.
++struct ReadOnlyState {
++    long long size;     // remote size in bytes (-1 = unknown)
++    bool pulled;        // full content fetched locally; serve via pullFd
++    long long ddBytes;  // bytes served via dd range reads so far
++    int pullFd;         // fd for the pulled file (-1 = none). adb pull
++                        // REPLACES the temp file (new inode), so the fd from
++                        // adb_open goes stale and must be re-opened.
++};
++static map<int, ReadOnlyState> roState;
++static std::mutex roStateLock;
++
++// One mutex per remote path, serializing adb_pull/push of the same file
++// across concurrent FUSE threads (the libfuse 2 handler runs multithreaded).
++static map<string, shared_ptr<mutex>> pullLocks;
++static mutex pullLocksLock;
++
++static shared_ptr<mutex> pullMutexFor(const string& path) {
++    lock_guard<mutex> g(pullLocksLock);
++    map<string, shared_ptr<mutex>>::iterator it = pullLocks.find(path);
++    if (it == pullLocks.end())
++        it = pullLocks.insert(make_pair(path, shared_ptr<mutex>(new mutex()))).first;
++    return it->second;
 +}
 +
-+/*
-+   adbFS implementation of fuse_operations.statfs.
-+
-+   Added for DroidMount: without this the mounted volume reports 0 bytes free, so
-+   Finder/NFS refuse any copy *into* the phone with "not enough space available".
-+   We report /sdcard's real free/total space by parsing `df -k /sdcard` on the device.
-+   macOS calls statfs on the mount root (device "/"), whose filesystem is Android's
-+   tiny, always-full root partition — useless and misleading. The writable area this
-+   tool exists for is /sdcard, so we always report that. Columns are:
-+   Filesystem 1K-blocks Used Available [Use%] Mounted-on, so the numeric tokens are
-+   [total, used, available]; df -k blocks are 1 KiB.
-+ */
-+static int adb_statfs(const char *path, struct statvfs *stbuf) {
-+    (void)path;   // always report /sdcard, regardless of which path was queried
-+    memset(stbuf, 0, sizeof(struct statvfs));
-+
-+    queue<string> output = adb_shell("df -k /sdcard");
-+
-+    unsigned long long total_k = 0, avail_k = 0;
-+    while (!output.empty()) {
-+        string line = output.front(); output.pop();
-+        vector<string> cols = make_array(line);
-+        vector<unsigned long long> nums;
-+        for (size_t i = 0; i < cols.size(); ++i) {
-+            string t = cols[i];
-+            if (!t.empty() && t[t.size() - 1] == '%') t = t.substr(0, t.size() - 1);
-+            if (str_all_digits(t)) nums.push_back(strtoull(t.c_str(), NULL, 10));
-+        }
-+        if (nums.size() >= 3) { total_k = nums[0]; avail_k = nums[2]; break; }
-+    }
-+
-+    if (total_k == 0) {
-+        // Couldn't parse df: advertise a large volume so writes aren't blocked.
-+        total_k = 64ULL * 1024 * 1024;   // 64 GiB
-+        avail_k = 32ULL * 1024 * 1024;   // 32 GiB
-+    }
-+
-+    stbuf->f_bsize   = 1024;             // df -k => 1 KiB blocks
-+    stbuf->f_frsize  = 1024;
-+    stbuf->f_blocks  = (fsblkcnt_t)total_k;
-+    stbuf->f_bfree   = (fsblkcnt_t)avail_k;
-+    stbuf->f_bavail  = (fsblkcnt_t)avail_k;
-+    stbuf->f_namemax = 255;
-+    return 0;
+ /**
+    Custom options
+  */
+ 
+ struct adb_config {
+     bool rescan;
++    char *rootdir;   // NULL => "/" (whole device)
+ };
+ 
+ static struct fuse_opt adb_opts[] = {
+     { "rescan", offsetof(struct adb_config, rescan), true },
++    { "rootdir=%s", offsetof(struct adb_config, rootdir), -1 },
+     FUSE_OPT_END
+ };
+ 
+ static struct adb_config adbfs_conf;
+ 
++// DroidMount: prefix for all device paths. FUSE paths are relative to the
++// mountpoint; the daemon serves them from <devRoot><fusePath> on the phone.
++// Defaults to "/" (upstream behavior: whole device). DroidMount.app mounts
++// with rootdir=/sdcard so the volume is the phone's user storage directly —
++// at startup a symlink root is resolved (on most phones /sdcard points at
++// /storage/emulated/0), because `ls -ld` on a symlink looks like "no file".
++static string devRoot = "/";
++static string devPath(const string& fusePath) {
++    if (devRoot == "/") return fusePath;
++    if (fusePath == "/") return devRoot;
++    return devRoot + fusePath;
 +}
 +
-+/*
-+   adbFS implementation of fuse_operations.create.
-+
-+   Added for FUSE-T compatibility (DroidMount): FUSE-T's NFS backend issues a
-+   `create` call for new files instead of synthesizing it from mknod+open the
-+   way macFUSE does. Without this, opening a non-existent file for write fell
-+   through adb_open's "file not found" path and returned -ENOENT (surfaced to
-+   the user as EACCES). Here we create the local temp file, hand back its fd,
-+   and push an empty file so it exists on the device immediately; subsequent
-+   writes go to fi->fh and adb_flush pushes the final contents.
-+ */
-+static int adb_create(const char *path, mode_t mode, struct fuse_file_info *fi)
-+{
-+    string path_string;
-+    string local_path_string;
-+    path_string.assign(path);
-+    local_path_string = tempDirPath;
-+    string_replacer(path_string,"/","-");
-+    local_path_string.append(path_string);
-+    path_string.assign(path);
-+
-+    string filehandle_path = local_path_string;
-+
-+    // Create (or truncate) the local backing file and keep it open for writes.
-+    int fd = open(filehandle_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, mode | S_IRUSR | S_IWUSR);
-+    if (fd == -1)
-+        return -errno;
-+    fi->fh = fd;
-+    filePendingWrite[fd] = true;
-+
-+    // Make the file exist on the device now (empty); flush will push contents.
-+    shell_escape_path(path_string);
-+    shell_escape_path(local_path_string);
-+    adb_push(local_path_string, path_string);
-+    adb_shell("sync");
-+    invalidateCache(path_string);
-+
-+    return 0;
-+}
-+
- static int adb_open(const char *path, struct fuse_file_info *fi)
+ /**
+    Return the result of executing the given command string, using
+    exec_command, on the local host.
+@@ -310,9 +357,10 @@ queue<string> adb_push(const string& local_source,
  {
+     string cmd;
+     adb_push_pull_cmd(cmd, true, local_source, remote_destination);
+-    queue<string> res = exec_command(cmd);
+-    invalidateCache(remote_destination);
+-    return res;
++    // Note: no invalidateCache here — cache keys are FUSE paths (relative to
++    // the mountpoint), while remote_destination is the full device path.
++    // Callers invalidate the cache themselves.
++    return exec_command(cmd);
+ }
+ 
+ /**
+@@ -424,14 +472,16 @@ static int adb_getattr(const char *path, struct stat *stbuf)
+     queue<string> output;
      string path_string;
-@@ -1102,6 +1196,8 @@ int main(int argc, char *argv[])
-     adbfs_oper.getattr= adb_getattr;
-     adbfs_oper.access= adb_access;
-     adbfs_oper.open= adb_open;
-+    adbfs_oper.create = adb_create;
-+    adbfs_oper.statfs = adb_statfs;
-     adbfs_oper.flush = adb_flush;
-     adbfs_oper.release = adb_release;
-     adbfs_oper.read= adb_read;
-diff --git a/adbfs.cpp b/adbfs.cpp
-index 018e535..d11bf51 100644
---- a/adbfs.cpp
-+++ b/adbfs.cpp
-@@ -767,23 +767,38 @@ static int adb_open(const char *path, struct fuse_file_info *fi)
+     path_string.assign(path);
+-    shell_escape_path(path_string);
++    shell_escape_path(path_string);   // cache key: FUSE path
++    string dev = devPath(path);
++    shell_escape_path(dev);           // device command: full device path
+     // TODO /caching?
+     //
+     vector<string> output_chunk;
+     if (fileData.find(path_string) ==  fileData.end()
+ 	|| fileData[path_string].timestamp + 30 < time(NULL)) {
+         string command = "ls -l -a -d '";
+-        command.append(path_string);
++        command.append(dev);
+         command.append("'");
+         output = adb_shell(command, true);
+         if (output.empty()) return -EAGAIN; /* no phone */
+@@ -594,11 +644,13 @@ static int adb_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+     local_path_string.append(path_string);
+     path_string.assign(path);
+ 
+-    shell_escape_path(path_string);
++    shell_escape_path(path_string);   // cache key: FUSE path
++    string dev = devPath(path);
++    shell_escape_path(dev);           // device command: full device path
+ 
+     queue<string> output;
+     string command = "ls -l -a '";
+-    command.append(path_string);
++    command.append(dev);
+     command.append("'");
+     output = adb_shell(command);
+ 
+@@ -658,6 +710,41 @@ static bool str_all_digits(const string& s) {
+     return true;
+ }
+ 
++// DroidMount (lazy-reads): read the size field out of an `ls -l -a -d` line.
++// Layout: mode nlink owner group size date time name, but when the nlink
++// column is 0 the owner/group pair shifts left (mirrors adb_getattr's
++// uid_offset, which indexes the size as uid_offset + 3).
++static long long parse_ls_size(const string& line) {
++    if (!is_valid_ls_output(line)) return -1;
++    vector<string> t = make_array(line);
++    int uid_offset = 0;
++    if (t.size() >= 2 && str_all_digits(t[1]) && atoi(t[1].c_str()) > 0)
++        uid_offset = 1;
++    size_t sizeIdx = (size_t)(3 + uid_offset);
++    if (t.size() < sizeIdx + 1) return -1;
++    if (!str_all_digits(t[sizeIdx])) return -1;
++    return atoll(t[sizeIdx].c_str());
++}
++
++static bool parse_ls_is_dir(const string& line) {
++    return is_valid_ls_output(line) && line[0] == 'd';
++}
++
++// DroidMount (lazy-reads) strategy thresholds.
++//
++// Files at or under FULL_PULL_MAX are pulled in full on first read: one adb
++// call, then every subsequent read is a fast local pread. Above it we stay
++// on dd range reads (cheap peeks: thumbnails / Quick Look of a big video)
++// unless the client shows it really wants the content:
++//   - a single read request of >= LARGE_READ (consumers read in big chunks), or
++//   - cumulative dd bytes >= PULL_UPGRADE_AT (file must be <= PULL_UPGRADE_MAX).
++static const long long FULL_PULL_MAX    = 32LL * 1024 * 1024;
++static const long long LARGE_READ       = 128LL * 1024;
++static const long long PULL_UPGRADE_MAX = 256LL * 1024 * 1024;
++static const long long PULL_UPGRADE_AT  = 8LL * 1024 * 1024;
++// Bound a single dd fetch so a huge read request can't blow up the buffer.
++static const size_t   MAX_DD_FETCH      = 8 * 1024 * 1024;
++
+ /*
+    adbFS implementation of fuse_operations.statfs.
+ 
+@@ -670,10 +757,25 @@ static bool str_all_digits(const string& s) {
+    Filesystem 1K-blocks Used Available [Use%] Mounted-on, so the numeric tokens are
+    [total, used, available]; df -k blocks are 1 KiB.
+  */
++static struct statvfs statfs_cached;
++static time_t statfs_cached_at = 0;
++static bool statfs_cached_valid = false;
++static mutex statfs_lock;
++
+ static int adb_statfs(const char *path, struct statvfs *stbuf) {
+     (void)path;   // always report /sdcard, regardless of which path was queried
+     memset(stbuf, 0, sizeof(struct statvfs));
+ 
++    // DroidMount: Finder/NFS probe free space often; `df` is one adb spawn,
++    // so serve a short-TTL cache instead of hitting the device every call.
++    {
++        lock_guard<mutex> g(statfs_lock);
++        if (statfs_cached_valid && time(NULL) - statfs_cached_at < 5) {
++            *stbuf = statfs_cached;
++            return 0;
++        }
++    }
++
+     queue<string> output = adb_shell("df -k /sdcard");
+ 
+     unsigned long long total_k = 0, avail_k = 0;
+@@ -701,6 +803,13 @@ static int adb_statfs(const char *path, struct statvfs *stbuf) {
+     stbuf->f_bfree   = (fsblkcnt_t)avail_k;
+     stbuf->f_bavail  = (fsblkcnt_t)avail_k;
+     stbuf->f_namemax = 255;
++
++    {
++        lock_guard<mutex> g(statfs_lock);
++        statfs_cached = *stbuf;
++        statfs_cached_at = time(NULL);
++        statfs_cached_valid = true;
++    }
+     return 0;
+ }
+ 
+@@ -737,7 +846,9 @@ static int adb_create(const char *path, mode_t mode, struct fuse_file_info *fi)
+     // Make the file exist on the device now (empty); flush will push contents.
+     shell_escape_path(path_string);
+     shell_escape_path(local_path_string);
+-    adb_push(local_path_string, path_string);
++    string dev = devPath(path);
++    shell_escape_path(dev);
++    adb_push(local_path_string, dev);
+     adb_shell("sync");
+     invalidateCache(path_string);
+ 
+@@ -759,11 +870,15 @@ static int adb_open(const char *path, struct fuse_file_info *fi)
+     shell_escape_path(path_string);
+     shell_escape_path(local_path_string);
+ 
++    string dev = devPath(path);
++    string dev_escaped = dev;
++    shell_escape_path(dev_escaped);
++
+     cout << "-- adb_open --" << path_string << " " << local_path_string << "\n";
+     if (!fileTruncated[path_string]){
+         queue<string> output;
+         string command = "ls -l -a -d '";
+-        command.append(path_string);
++        command.append(dev_escaped);
          command.append("'");
          cout << command<<"\n";
          output = adb_shell(command);
-+        if (output.empty())
-+            return -EIO;
-         vector<string> output_chunk = make_array(output.front());
-         if (!is_valid_ls_output(output_chunk[0])) {
+@@ -774,20 +889,30 @@ static int adb_open(const char *path, struct fuse_file_info *fi)
            return -ENOENT;
          }
--        path_string.assign(path);
--        local_path_string = tempDirPath;
--        string_replacer(path_string,"/","-");
--        local_path_string.append(path_string);
--        path_string.assign(path);
--        shell_escape_path(path_string);
--        shell_escape_path(local_path_string);
--        adb_pull(path_string,local_path_string);
-+        if ((fi->flags & O_ACCMODE) != O_RDONLY) {
-+            path_string.assign(path);
-+            local_path_string = tempDirPath;
-+            string_replacer(path_string,"/","-");
-+            local_path_string.append(path_string);
-+            path_string.assign(path);
-+            shell_escape_path(path_string);
-+            shell_escape_path(local_path_string);
-+            adb_pull(path_string,local_path_string);
-+        } else {
-+            // Finder often opens files just to inspect or preview them. Keep
-+            // read-only opens cheap; adb_read fetches only the requested ranges.
-+            int fd = open(filehandle_path.c_str(), O_RDONLY | O_CREAT, S_IRUSR | S_IWUSR);
-+            if (fd == -1)
-+                return -errno;
-+            fi->fh = fd;
-+            fi->direct_io = 1;
-+            return 0;
+         if ((fi->flags & O_ACCMODE) != O_RDONLY) {
+-            path_string.assign(path);
+-            local_path_string = tempDirPath;
+-            string_replacer(path_string,"/","-");
+-            local_path_string.append(path_string);
+-            path_string.assign(path);
+-            shell_escape_path(path_string);
+-            shell_escape_path(local_path_string);
+-            adb_pull(path_string,local_path_string);
++            // Serialize per-path pulls so two concurrent opens of the same
++            // file can't clobber each other's temp copy.
++            shared_ptr<mutex> pl = pullMutexFor(path);
++            lock_guard<mutex> plock(*pl);
++            adb_pull(dev_escaped, local_path_string);
+         } else {
+             // Finder often opens files just to inspect or preview them. Keep
+-            // read-only opens cheap; adb_read fetches only the requested ranges.
+-            int fd = open(filehandle_path.c_str(), O_RDONLY | O_CREAT, S_IRUSR | S_IWUSR);
++            // read-only opens cheap: no pull here; adb_read fetches only the
++            // requested ranges (dd), upgrading to a full pull when the
++            // client clearly wants the content.
++            if (parse_ls_is_dir(output.front()))
++                return -EISDIR;
++            int fd = open(filehandle_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+             if (fd == -1)
+                 return -errno;
++            {
++                lock_guard<mutex> g(roStateLock);
++                ReadOnlyState st;
++                st.size = parse_ls_size(output.front());
++                st.pulled = false;
++                st.ddBytes = 0;
++                st.pullFd = -1;
++                roState[fd] = st;
++            }
+             fi->fh = fd;
+             fi->direct_io = 1;
+             return 0;
+@@ -812,12 +937,93 @@ static int adb_read(const char *path, char *buf, size_t size, off_t offset,
+         if (size == 0)
+             return 0;
+ 
++        // Per-open state registered by adb_open (fd in fi->fh).
++        ReadOnlyState st;
++        st.size = -1; st.pulled = false; st.ddBytes = 0; st.pullFd = -1;
++        {
++            lock_guard<mutex> g(roStateLock);
++            map<int, ReadOnlyState>::iterator it = roState.find(fi->fh);
++            if (it != roState.end()) st = it->second;
 +        }
-     } else {
-         fileTruncated[path_string] = false;
++
++        // Clamp the request to EOF when the size is known: no adb spawn at all
++        // for reads past end of file.
++        if (st.size >= 0) {
++            if ((long long)offset >= st.size) return 0;
++            if ((long long)size > st.size - offset)
++                size = (size_t)(st.size - offset);
++            if (size == 0) return 0;
++        }
++
++        string local_path_string = tempDirPath;
++        string local_key = path;
++        string_replacer(local_key, "/", "-");
++        local_path_string += local_key;
++
++        // Decide: one-shot full pull (fast from then on) or a cheap dd range
++        // read? Small files always pull; a big single read means the client is
++        // consuming the content; a client that has dd-fetched a lot upgrades.
++        if (!st.pulled) {
++            bool fullPull = false;
++            if (st.size >= 0 && st.size <= FULL_PULL_MAX)
++                fullPull = true;
++            else if (size >= LARGE_READ)
++                fullPull = true;
++            else if (st.size > 0 && st.size <= PULL_UPGRADE_MAX && st.ddBytes >= PULL_UPGRADE_AT)
++                fullPull = true;
++
++            if (fullPull) {
++                string remote_escaped(devPath(path));
++                string local_escaped = local_path_string;
++                shell_escape_path(remote_escaped);
++                shell_escape_path(local_escaped);
++                shared_ptr<mutex> pl = pullMutexFor(path);
++                lock_guard<mutex> plock(*pl);
++                // Another opener may have pulled this very file while we
++                // waited for the per-path lock; reuse it instead of re-pulling.
++                struct stat l;
++                bool ready = false;
++                if (stat(local_path_string.c_str(), &l) == 0) {
++                    ready = (st.size >= 0) ? (l.st_size == st.size)
++                                           : (l.st_size > 0);
++                }
++                if (!ready) {
++                    adb_pull(remote_escaped, local_escaped);
++                    ready = false;
++                    if (stat(local_path_string.c_str(), &l) == 0) {
++                        ready = (st.size >= 0) ? (l.st_size == st.size)
++                                               : (l.st_size > 0);
++                    }
++                }
++                // adb pull replaces the temp file with a new inode, so the
++                // fd from adb_open is stale; re-open for serving reads.
++                if (ready && st.pullFd < 0)
++                    st.pullFd = open(local_path_string.c_str(), O_RDONLY);
++                // Pull failed (device vanished, I/O error): fall through to dd,
++                // which serves whatever the device has right now.
++                st.pulled = ready && st.pullFd >= 0;
++                {
++                    lock_guard<mutex> g(roStateLock);
++                    roState[fi->fh] = st;
++                }
++            }
++        }
++
++        if (st.pulled) {
++            int res = pread(st.pullFd, buf, size, offset);
++            if (res == -1) res = -errno;
++            return res;
++        }
++
++        // Cheap path: fetch just the requested range with dd. One adb spawn
++        // per read, but only the bytes actually wanted cross the wire.
+         const size_t block_size = 4096;
++        size_t fetch = (size > MAX_DD_FETCH) ? MAX_DD_FETCH : size;
+         unsigned long long start_block = (unsigned long long)offset / block_size;
+         size_t block_offset = (size_t)offset % block_size;
+-        size_t blocks = (block_offset + size + block_size - 1) / block_size;
++        size_t blocks = (block_offset + fetch + block_size - 1) / block_size;
+ 
+-        string remote_path(path);
++        string remote_path(devPath(path));
+         // Quote the device path for the Android shell, then quote that whole
+         // script for the Mac shell which launches adb.
+         string device_quoted = "'";
+@@ -847,8 +1053,14 @@ static int adb_read(const char *path, char *buf, size_t size, off_t offset,
+         if (bytes <= block_offset)
+             return status == 0 ? 0 : -EIO;
+         size_t available = bytes - block_offset;
+-        size_t copied = available < size ? available : size;
++        size_t copied = available < fetch ? available : fetch;
+         memcpy(buf, chunk.data() + block_offset, copied);
++        {
++            lock_guard<mutex> g(roStateLock);
++            map<int, ReadOnlyState>::iterator it = roState.find(fi->fh);
++            if (it != roState.end())
++                it->second.ddBytes += (long long)copied;
++        }
+         return (int)copied;
      }
-
-     fi->fh = open(filehandle_path.c_str(), fi->flags);
-+    if (fi->fh == -1)
-+        return -errno;
-
+ 
+@@ -896,6 +1108,9 @@ static int adb_flush(const char *path, struct fuse_file_info *fi) {
+ 
+     shell_escape_path(path_string);
+     shell_escape_path(local_path_string);
++    string dev = devPath(path);
++    string dev_escaped = dev;
++    shell_escape_path(dev_escaped);
+ 
+     int flags = fi->flags;
+     int fd = fi->fh;
+@@ -903,9 +1118,9 @@ static int adb_flush(const char *path, struct fuse_file_info *fi) {
+     invalidateCache(path_string);
+     if (filePendingWrite[fd]) {
+         filePendingWrite[fd] = false;
+-        adb_push(local_path_string, path_string);
++        adb_push(local_path_string, dev_escaped);
+         adb_shell("sync");
+-        if (adbfs_conf.rescan) adb_rescan_file(path_string);
++        if (adbfs_conf.rescan) adb_rescan_file(dev);
+     }
      return 0;
  }
-@@ -791,6 +806,52 @@ static int adb_open(const char *path, struct fuse_file_info *fi)
- static int adb_read(const char *path, char *buf, size_t size, off_t offset,
-     struct fuse_file_info *fi)
- {
-+    if ((fi->flags & O_ACCMODE) == O_RDONLY) {
-+        if (offset < 0)
-+            return -EINVAL;
-+        if (size == 0)
-+            return 0;
-+
-+        const size_t block_size = 4096;
-+        unsigned long long start_block = (unsigned long long)offset / block_size;
-+        size_t block_offset = (size_t)offset % block_size;
-+        size_t blocks = (block_offset + size + block_size - 1) / block_size;
-+
-+        string remote_path(path);
-+        // Quote the device path for the Android shell, then quote that whole
-+        // script for the Mac shell which launches adb.
-+        string device_quoted = "'";
-+        for (size_t i = 0; i < remote_path.size(); ++i) {
-+            if (remote_path[i] == '\'') device_quoted += "'\\''";
-+            else device_quoted += remote_path[i];
+@@ -925,11 +1140,21 @@ static int adb_release(const char *path, struct fuse_file_info *fi) {
+     map<int, bool>::iterator pending = filePendingWrite.find(fd);
+     if (pending != filePendingWrite.end())
+         filePendingWrite.erase(pending);
+-    if (fd >= 0 && close(fd) == -1)
+-        return -errno;
+-    
++    if (fd >= 0) {
++        int pullFd = -1;
++        {
++            lock_guard<mutex> g(roStateLock);
++            map<int, ReadOnlyState>::iterator it = roState.find(fd);
++            if (it != roState.end()) pullFd = it->second.pullFd;
++            roState.erase(fd);
 +        }
-+        device_quoted += "'";
-+        ostringstream script;
-+        script << "dd if=" << device_quoted << " bs=" << block_size
-+               << " skip=" << start_block << " count=" << blocks << " 2>/dev/null";
-+        string script_quoted = "'";
-+        for (size_t i = 0; i < script.str().size(); ++i) {
-+            if (script.str()[i] == '\'') script_quoted += "'\\''";
-+            else script_quoted += script.str()[i];
-+        }
-+        script_quoted += "'";
-+        string command = "adb exec-out sh -c ";
-+        command += script_quoted;
-+
-+        FILE *pipe = popen(command.c_str(), "r");
-+        if (!pipe)
++        if (pullFd >= 0) close(pullFd);
++        if (close(fd) == -1)
 +            return -errno;
-+        vector<char> chunk(blocks * block_size);
-+        size_t bytes = fread(chunk.data(), 1, chunk.size(), pipe);
-+        int status = pclose(pipe);
-+        if (bytes <= block_offset)
-+            return status == 0 ? 0 : -EIO;
-+        size_t available = bytes - block_offset;
-+        size_t copied = available < size ? available : size;
-+        memcpy(buf, chunk.data() + block_offset, copied);
-+        return (int)copied;
 +    }
 +
-     int fd;
-     int res;
-     fd = fi->fh; //open(local_path_string.c_str(), O_RDWR);
-@@ -861,8 +922,11 @@ static int adb_release(const char *path, struct fuse_file_info *fi) {
-
-     // untouched
-     int fd = fi->fh;
--    filePendingWrite.erase(filePendingWrite.find(fd));
--    close(fd);
-+    map<int, bool>::iterator pending = filePendingWrite.find(fd);
-+    if (pending != filePendingWrite.end())
-+        filePendingWrite.erase(pending);
-+    if (fd >= 0 && close(fd) == -1)
-+        return -errno;
-
      // remove local copy
+-    unlink(local_path_string.c_str());    
++    unlink(local_path_string.c_str());
+     return 0;
+ }
+ 
+@@ -945,6 +1170,10 @@ static int adb_utimens(const char *path, const struct timespec ts[2]) {
+ 
+     shell_escape_path(path_string);
+ 
++    string dev = devPath(path);
++    string dev_escaped = dev;
++    shell_escape_path(dev_escaped);
++
+     bool set_atime = true;
+     bool set_mtime = true;
+     struct timespec atime = ts[0];
+@@ -971,7 +1200,7 @@ static int adb_utimens(const char *path, const struct timespec ts[2]) {
+         command.append("touch -a -d ");
+         command.append(format_touch_time(atime, touch_gnu_mode));
+         command.append(" '");
+-        command.append(path_string);
++        command.append(dev_escaped);
+         command.append("'");
+         if (set_mtime)
+             command.append(" && ");
+@@ -980,7 +1209,7 @@ static int adb_utimens(const char *path, const struct timespec ts[2]) {
+         command.append("touch -m -d ");
+         command.append(format_touch_time(mtime, touch_gnu_mode));
+         command.append(" '");
+-        command.append(path_string);
++        command.append(dev_escaped);
+         command.append("'");
+     }
+     cout << command<<"\n";
+@@ -1008,7 +1237,7 @@ static int adb_utimens(const char *path, const struct timespec ts[2]) {
+     }
+ 
+     // If we forgot to mount -o rescan then we can remount and touch to trigger the scan.
+-    if (adbfs_conf.rescan) adb_rescan_file(path_string);
++    if (adbfs_conf.rescan) adb_rescan_file(dev);
+ 
+     return 0;
+ }
+@@ -1025,18 +1254,21 @@ static int adb_truncate(const char *path, off_t size) {
+     string local_path_string_escaped = local_path_string;
+     shell_escape_path(path_string);
+     shell_escape_path(local_path_string_escaped);
++    string dev = devPath(path);
++    string dev_escaped = dev;
++    shell_escape_path(dev_escaped);
+ 
+ 
+     queue<string> output;
+     cout << "adb_truncate" << endl;
+     string command = "ls -l -a -d '";
+-    command.append(path_string);
++    command.append(dev_escaped);
+     command.append("'");
+     cout << command << "\n";
+     output = adb_shell(command);
+     vector<string> output_chunk = make_array(output.front());
+     if (output_chunk[0][0] == '/'){
+-        adb_pull(path_string,local_path_string_escaped);
++        adb_pull(dev_escaped,local_path_string_escaped);
+     }
+ 
+     fileTruncated[path_string] = true;
+@@ -1062,8 +1294,11 @@ static int adb_mknod(const char *path, mode_t mode, dev_t rdev) {
+ 
+     shell_escape_path(path_string);
+     shell_escape_path(local_path_string);
++    string dev = devPath(path);
++    string dev_escaped = dev;
++    shell_escape_path(dev_escaped);
+ 
+-    adb_push(local_path_string,path_string);
++    adb_push(local_path_string,dev_escaped);
+     adb_shell("sync");
+ 
+     invalidateCache(path_string);
+@@ -1082,10 +1317,13 @@ static int adb_mkdir(const char *path, mode_t mode) {
+     path_string.assign(path);
+ 
+     shell_escape_path(path_string);
++    string dev = devPath(path);
++    string dev_escaped = dev;
++    shell_escape_path(dev_escaped);
+ 
+     string command;
+     command.assign("mkdir '");
+-    command.append(path_string);
++    command.append(dev_escaped);
+     command.append("'");
+     adb_shell(command);
+     invalidateCache(path_string);
+@@ -1108,16 +1346,23 @@ static int adb_rename(const char *from, const char *to) {
+     shell_escape_path(to_string);
+ 
+ 
++    string dev_from = devPath(from);
++    string dev_to = devPath(to);
++    string dev_from_escaped = dev_from;
++    string dev_to_escaped = dev_to;
++    shell_escape_path(dev_from_escaped);
++    shell_escape_path(dev_to_escaped);
++
+     string command = "mv '";
+-    command.append(from_string);
++    command.append(dev_from_escaped);
+     command.append("' '");
+-    command.append(to_string);
++    command.append(dev_to_escaped);
+     command.append("'");
+     cout << "Renaming " << from << " to " << to <<"\n";
+     adb_shell(command);
+     if (adbfs_conf.rescan) {
+-        adb_rescan_file(from);
+-        adb_rescan_file(to);
++        adb_rescan_file(dev_from);
++        adb_rescan_file(dev_to);
+     }
+     invalidateCache(string(from));
+     invalidateCache(string(to));
+@@ -1136,13 +1381,15 @@ static int adb_rmdir(const char *path) {
+ 
+     shell_escape_path(path_string);
+     shell_escape_path(local_path_string);
+-
++    string dev = devPath(path);
++    string dev_escaped = dev;
++    shell_escape_path(dev_escaped);
+ 
+     string command = "rmdir '";
+-    command.append(path_string);
++    command.append(dev_escaped);
+     command.append("'");
+     adb_shell(command);
+-    if (adbfs_conf.rescan) adb_rescan_dir_removed(path_string);
++    if (adbfs_conf.rescan) adb_rescan_dir_removed(dev);
+     invalidateCache(path_string);
+ 
+     //rmdir(local_path_string.c_str());
+@@ -1161,12 +1408,15 @@ static int adb_unlink(const char *path) {
+ 
+     shell_escape_path(path_string);
+     shell_escape_path(local_path_string);
++    string dev = devPath(path);
++    string dev_escaped = dev;
++    shell_escape_path(dev_escaped);
+ 
+     string command = "rm '";
+-    command.append(path_string);
++    command.append(dev_escaped);
+     command.append("'");
+     adb_shell(command);
+-    if (adbfs_conf.rescan) adb_rescan_file(path_string);
++    if (adbfs_conf.rescan) adb_rescan_file(dev);
+     invalidateCache(path_string);
      unlink(local_path_string.c_str());
+     return 0;
+@@ -1177,6 +1427,9 @@ static int adb_readlink(const char *path, char *buf, size_t size)
+     cout << "adb_readlink" << endl;
+     string path_string(path);
+     shell_escape_path(path_string);
++    string dev = devPath(path);
++    string dev_escaped = dev;
++    shell_escape_path(dev_escaped);
+ 
+     queue<string> output;
+ 
+@@ -1190,7 +1443,7 @@ static int adb_readlink(const char *path, char *buf, size_t size)
+     if (fileData.find(path_string) ==  fileData.end()
+ 	|| fileData[path_string].timestamp + 30 < time(NULL)) {
+         string command = "ls -l -a -d '";
+-        command.append(path_string);
++        command.append(dev_escaped);
+         command.append("'");
+         output = adb_shell(command);
+         if (output.empty())
+@@ -1280,5 +1533,25 @@ int main(int argc, char *argv[])
+     memset(&adbfs_conf, 0, sizeof(adbfs_conf));
+     fuse_opt_parse(&args, &adbfs_conf, adb_opts, NULL);
+ 
++    // DroidMount: mount <rootdir> as the volume root (default: whole device).
++    if (adbfs_conf.rootdir) {
++        devRoot = adbfs_conf.rootdir;
++        while (devRoot.size() > 1 && devRoot[devRoot.size() - 1] == '/')
++            devRoot.erase(devRoot.size() - 1);
++        if (!devRoot.empty() && devRoot[0] != '/')
++            devRoot = "/" + devRoot;
++        if (devRoot != "/") {
++            // /sdcard is a symlink on most phones; `ls -ld` on a symlink would
++            // look like "no such file" to the rest of the daemon, so resolve
++            // to the real directory (e.g. /storage/emulated/0).
++            queue<string> out = adb_shell("readlink -f '" + devRoot + "'");
++            if (!out.empty() && !out.front().empty() &&
++                out.front()[0] == '/' && out.front() != devRoot) {
++                devRoot = out.front();
++            }
++        }
++        cout << "adbfs serving rootdir: " << devRoot << "\n";
++    }
++
+     return fuse_main(args.argc, args.argv, &adbfs_oper, NULL);
+ }

@@ -36,6 +36,8 @@ echo "Mounting $SERIAL at $MOUNT (read/write) ..."
 # ANDROID_SERIAL pins every bare `adb` call inside the daemon to this device.
 # PATH ensures the daemon (which popen's `adb ...`) finds adb.
 # -f keeps it in the foreground so the controlling app can supervise it.
+# -o rootdir=/sdcard mounts the phone's user storage as the volume root,
+# not the device root (whose partitions are tiny and mostly read-only).
 export ANDROID_SERIAL="$SERIAL"
 export PATH="$PLATFORM_TOOLS:$PATH"
-exec "$ADBFS" -f "$MOUNT"
+exec "$ADBFS" -f -o rootdir=/sdcard "$MOUNT"

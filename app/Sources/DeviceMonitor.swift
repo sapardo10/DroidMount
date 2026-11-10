@@ -7,11 +7,15 @@ struct Device: Equatable {
 }
 
 /// Polls `adb devices -l` on a timer and reports the attached devices.
+/// A generation counter discards results from superseded polls, and a watchdog
+/// kills adb calls that hang, so a wedged adb can never stall the device list.
 final class DeviceMonitor {
     private(set) var devices: [Device] = []
     var onChange: (([Device]) -> Void)?
 
     private var timer: Timer?
+    private let lock = NSLock()
+    private var generation = 0
 
     func start(interval: TimeInterval = 3.0) {
         poll()
@@ -26,6 +30,11 @@ final class DeviceMonitor {
         guard let adb = MountController.adbPath() else {
             update([]); return
         }
+        lock.lock()
+        generation += 1
+        let gen = generation
+        lock.unlock()
+
         DispatchQueue.global(qos: .background).async { [weak self] in
             let p = Process()
             p.executableURL = URL(fileURLWithPath: adb)
@@ -33,13 +42,29 @@ final class DeviceMonitor {
             let pipe = Pipe()
             p.standardOutput = pipe
             p.standardError = FileHandle.nullDevice
-            do { try p.run() } catch { DispatchQueue.main.async { self?.update([]) }; return }
-            p.waitUntilExit()
-            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+            var out = ""
+            do {
+                try p.run()
+                // Watchdog: kill a hung adb so the next timer tick can supersede it.
+                let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 8, execute: watchdog)
+                p.waitUntilExit()
+                watchdog.cancel()
+                out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
                              encoding: .utf8) ?? ""
+            } catch {
+                out = ""
+            }
+            // Ignore results from superseded polls (slow adb, next tick already ran).
+            guard let self, self.isCurrent(gen) else { return }
             let parsed = DeviceMonitor.parse(out)
-            DispatchQueue.main.async { self?.update(parsed) }
+            DispatchQueue.main.async { self.update(parsed) }
         }
+    }
+
+    private func isCurrent(_ gen: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return generation == gen
     }
 
     private func update(_ new: [Device]) {

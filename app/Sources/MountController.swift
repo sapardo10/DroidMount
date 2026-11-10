@@ -14,7 +14,7 @@ final class MountController {
     private var daemon: Process?
 
     /// Where the device is mounted. Under the home dir so no root is needed.
-    let mountPoint = (NSHomeDirectory() as NSString).appendingPathComponent("DroidMount")
+    static let mountPoint = (NSHomeDirectory() as NSString).appendingPathComponent("DroidMount")
 
     var onStateChange: ((State) -> Void)?
 
@@ -48,6 +48,13 @@ final class MountController {
 
     // MARK: - Mount / unmount
 
+    /// Re-adopt a mount that is already active (e.g. the app was relaunched while
+    /// the drive was up). Best-effort serial attribution.
+    func adopt(serial: String) {
+        guard daemon == nil, isMounted() else { return }
+        setState(.mounted(serial: serial))
+    }
+
     func mount(serial: String) {
         guard daemon == nil else { return }
         guard let adb = MountController.adbPath() else {
@@ -57,15 +64,20 @@ final class MountController {
             setState(.error("adbfs daemon not found")); return
         }
 
+        // Clear a stale mount entry (orphaned daemon, previous run) before mounting.
+        if isMounted() { unmount() }
+
         try? FileManager.default.createDirectory(
-            atPath: mountPoint, withIntermediateDirectories: true)
+            atPath: MountController.mountPoint, withIntermediateDirectories: true)
 
         setState(.mounting(serial: serial))
 
         let platformTools = (adb as NSString).deletingLastPathComponent
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: adbfs)
-        proc.arguments = ["-f", mountPoint]
+        // -o rootdir=/sdcard: mount the phone's user storage as the volume root,
+        // not the device root (which has tiny, mostly read-only partitions).
+        proc.arguments = ["-f", "-o", "rootdir=/sdcard", MountController.mountPoint]
         var env = ProcessInfo.processInfo.environment
         env["ANDROID_SERIAL"] = serial                       // pin the device
         env["PATH"] = platformTools + ":" + (env["PATH"] ?? "/usr/bin:/bin")
@@ -118,20 +130,20 @@ final class MountController {
         p.waitUntilExit()
         let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         // FUSE-T mounts show as: fuse-t:/DroidMount on /Users/.../DroidMount (nfs,...)
-        return out.contains(" \(mountPoint) ")
+        return out.contains(" \(MountController.mountPoint) ")
     }
 
     func unmount() {
         // Unmounting causes the foreground daemon to exit on its own.
         let umount = Process()
         umount.executableURL = URL(fileURLWithPath: "/sbin/umount")
-        umount.arguments = [mountPoint]
+        umount.arguments = [MountController.mountPoint]
         try? umount.run()
         umount.waitUntilExit()
         if umount.terminationStatus != 0 {
             let force = Process()
             force.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-            force.arguments = ["unmount", "force", mountPoint]
+            force.arguments = ["unmount", "force", MountController.mountPoint]
             try? force.run()
             force.waitUntilExit()
         }
@@ -141,7 +153,7 @@ final class MountController {
     }
 
     func revealInFinder() {
-        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: mountPoint)
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: MountController.mountPoint)
     }
 
     private func setState(_ s: State) {

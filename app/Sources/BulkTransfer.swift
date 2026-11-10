@@ -75,19 +75,21 @@ final class BulkTransfer {
 
     // MARK: - Transfer
 
-    /// Run a transfer. `progress(done, total, label)` is called on a background queue;
-    /// `completion(error?)` fires when finished/cancelled. Per-item granularity.
+    /// Run a transfer. Progress reports the current item's byte count while ADB runs.
     func run(direction: Direction,
              items: [String],
              destination: String,
-             progress: @escaping (Int, Int, String) -> Void,
+             progress: @escaping (Int, Int, String, Int64, Int64?) -> Void,
              completion: @escaping (String?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             let total = items.count
             for (idx, item) in items.enumerated() {
                 if self.cancelled { completion(nil); return }
                 let name = (item as NSString).lastPathComponent
-                progress(idx, total, name)
+                let itemTotal = direction == .phoneToMac
+                    ? self.remoteSize(item)
+                    : self.localSize(item)
+                progress(idx, total, name, 0, itemTotal)
 
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: self.adb)
@@ -102,24 +104,88 @@ final class BulkTransfer {
                 let err = Pipe()
                 p.standardOutput = FileHandle.nullDevice
                 p.standardError = err
+                let errorLock = NSLock()
+                var errorData = Data()
+                let errorRead = DispatchGroup()
+                errorRead.enter()
+                DispatchQueue.global(qos: .utility).async {
+                    let data = err.fileHandleForReading.readDataToEndOfFile()
+                    errorLock.lock()
+                    errorData = data
+                    errorLock.unlock()
+                    errorRead.leave()
+                }
                 do { try p.run() } catch {
+                    err.fileHandleForReading.closeFile()
                     completion("Failed to launch adb: \(error.localizedDescription)"); return
                 }
                 self.current = p
+                let localTarget = (destination as NSString).appendingPathComponent(name)
+                let remoteTarget = (destination.hasSuffix("/") ? destination : destination + "/") + name
+                while p.isRunning && !self.cancelled {
+                    Thread.sleep(forTimeInterval: 0.5)
+                    let bytes = direction == .phoneToMac
+                        ? self.localSize(localTarget) ?? 0
+                        : self.remoteSize(remoteTarget) ?? 0
+                    progress(idx, total, name, min(bytes, itemTotal ?? bytes), itemTotal)
+                }
                 p.waitUntilExit()
                 self.current = nil
+                errorRead.wait()
 
                 if self.cancelled { completion(nil); return }
                 if p.terminationStatus != 0 {
-                    let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(),
-                                     encoding: .utf8) ?? ""
+                    errorLock.lock()
+                    let msg = String(data: errorData, encoding: .utf8) ?? ""
+                    errorLock.unlock()
                     completion("adb failed on \(name): \(msg.trimmingCharacters(in: .whitespacesAndNewlines))")
                     return
                 }
+                progress(idx + 1, total, name, itemTotal ?? 0, itemTotal)
             }
-            progress(total, total, "")
             completion(nil)
         }
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private func remoteSize(_ path: String) -> Int64? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: adb)
+        p.arguments = ["-s", serial, "shell", "du -sk \(shellQuote(path))"]
+        let output = Pipe()
+        p.standardOutput = output
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0,
+              let line = String(data: data, encoding: .utf8)?.split(whereSeparator: \.isNewline).first,
+              let kilobytes = Int64(line.split(whereSeparator: \.isWhitespace).first ?? "") else {
+            return nil
+        }
+        return kilobytes * 1024
+    }
+
+    private func localSize(_ path: String) -> Int64? {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else { return 0 }
+        if !isDirectory.boolValue {
+            return (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value
+        }
+        guard let enumerator = FileManager.default.enumerator(
+            at: URL(fileURLWithPath: path), includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey]) else {
+            return nil
+        }
+        var total: Int64 = 0
+        for case let url as URL in enumerator {
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true else { continue }
+            total += Int64(values.fileSize ?? 0)
+        }
+        return total
     }
 
     func cancel() {

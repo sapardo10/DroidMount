@@ -767,23 +767,38 @@ static int adb_open(const char *path, struct fuse_file_info *fi)
         command.append("'");
         cout << command<<"\n";
         output = adb_shell(command);
+        if (output.empty())
+            return -EIO;
         vector<string> output_chunk = make_array(output.front());
         if (!is_valid_ls_output(output_chunk[0])) {
           return -ENOENT;
         }
-        path_string.assign(path);
-        local_path_string = tempDirPath;
-        string_replacer(path_string,"/","-");
-        local_path_string.append(path_string);
-        path_string.assign(path);
-        shell_escape_path(path_string);
-        shell_escape_path(local_path_string);
-        adb_pull(path_string,local_path_string);
+        if ((fi->flags & O_ACCMODE) != O_RDONLY) {
+            path_string.assign(path);
+            local_path_string = tempDirPath;
+            string_replacer(path_string,"/","-");
+            local_path_string.append(path_string);
+            path_string.assign(path);
+            shell_escape_path(path_string);
+            shell_escape_path(local_path_string);
+            adb_pull(path_string,local_path_string);
+        } else {
+            // Finder often opens files just to inspect or preview them. Keep
+            // read-only opens cheap; adb_read fetches only the requested ranges.
+            int fd = open(filehandle_path.c_str(), O_RDONLY | O_CREAT, S_IRUSR | S_IWUSR);
+            if (fd == -1)
+                return -errno;
+            fi->fh = fd;
+            fi->direct_io = 1;
+            return 0;
+        }
     } else {
         fileTruncated[path_string] = false;
     }
 
     fi->fh = open(filehandle_path.c_str(), fi->flags);
+    if (fi->fh == -1)
+        return -errno;
 
     return 0;
 }
@@ -791,6 +806,52 @@ static int adb_open(const char *path, struct fuse_file_info *fi)
 static int adb_read(const char *path, char *buf, size_t size, off_t offset,
     struct fuse_file_info *fi)
 {
+    if ((fi->flags & O_ACCMODE) == O_RDONLY) {
+        if (offset < 0)
+            return -EINVAL;
+        if (size == 0)
+            return 0;
+
+        const size_t block_size = 4096;
+        unsigned long long start_block = (unsigned long long)offset / block_size;
+        size_t block_offset = (size_t)offset % block_size;
+        size_t blocks = (block_offset + size + block_size - 1) / block_size;
+
+        string remote_path(path);
+        // Quote the device path for the Android shell, then quote that whole
+        // script for the Mac shell which launches adb.
+        string device_quoted = "'";
+        for (size_t i = 0; i < remote_path.size(); ++i) {
+            if (remote_path[i] == '\'') device_quoted += "'\\''";
+            else device_quoted += remote_path[i];
+        }
+        device_quoted += "'";
+        ostringstream script;
+        script << "dd if=" << device_quoted << " bs=" << block_size
+               << " skip=" << start_block << " count=" << blocks << " 2>/dev/null";
+        string script_quoted = "'";
+        for (size_t i = 0; i < script.str().size(); ++i) {
+            if (script.str()[i] == '\'') script_quoted += "'\\''";
+            else script_quoted += script.str()[i];
+        }
+        script_quoted += "'";
+        string command = "adb exec-out sh -c ";
+        command += script_quoted;
+
+        FILE *pipe = popen(command.c_str(), "r");
+        if (!pipe)
+            return -errno;
+        vector<char> chunk(blocks * block_size);
+        size_t bytes = fread(chunk.data(), 1, chunk.size(), pipe);
+        int status = pclose(pipe);
+        if (bytes <= block_offset)
+            return status == 0 ? 0 : -EIO;
+        size_t available = bytes - block_offset;
+        size_t copied = available < size ? available : size;
+        memcpy(buf, chunk.data() + block_offset, copied);
+        return (int)copied;
+    }
+
     int fd;
     int res;
     fd = fi->fh; //open(local_path_string.c_str(), O_RDWR);
@@ -861,8 +922,11 @@ static int adb_release(const char *path, struct fuse_file_info *fi) {
 
     // untouched
     int fd = fi->fh;
-    filePendingWrite.erase(filePendingWrite.find(fd));
-    close(fd);
+    map<int, bool>::iterator pending = filePendingWrite.find(fd);
+    if (pending != filePendingWrite.end())
+        filePendingWrite.erase(pending);
+    if (fd >= 0 && close(fd) == -1)
+        return -errno;
     
     // remove local copy
     unlink(local_path_string.c_str());    

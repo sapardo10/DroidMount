@@ -142,7 +142,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         progressWin = win
         win.show()
         bt.run(direction: dir, items: items, destination: dest,
-               progress: { done, total, label in win.update(done: done, total: total, label: label) },
+               progress: { done, total, label, bytes, totalBytes in
+                   win.update(done: done, total: total, label: label,
+                              bytes: bytes, totalBytes: totalBytes)
+               },
                completion: { [weak self] err in
                    DispatchQueue.main.async {
                        win.finish()

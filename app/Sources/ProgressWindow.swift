@@ -48,14 +48,33 @@ final class ProgressWindow: NSWindowController {
         window?.level = .floating
     }
 
-    /// Update from any thread.
-    func update(done: Int, total: Int, label: String) {
+    /// Update from any thread with the current item's byte-level progress.
+    func update(done: Int, total: Int, label: String, bytes: Int64, totalBytes: Int64?) {
         DispatchQueue.main.async {
-            self.bar.maxValue = Double(max(total, 1))
-            self.bar.doubleValue = Double(done)
-            self.detailLabel.stringValue = label.isEmpty
-                ? "Finishing…"
-                : "(\(done + 1) of \(total))  \(label)"
+            let hasSize = (totalBytes ?? 0) > 0
+            self.bar.isIndeterminate = !hasSize
+            if hasSize {
+                self.bar.stopAnimation(nil)
+                self.bar.maxValue = Double(totalBytes!)
+                self.bar.doubleValue = Double(min(bytes, totalBytes!))
+            } else {
+                self.bar.startAnimation(nil)
+            }
+
+            guard !label.isEmpty else {
+                self.detailLabel.stringValue = "Finishing…"
+                return
+            }
+            let formatter = ByteCountFormatter()
+            formatter.countStyle = .file
+            let copied = formatter.string(fromByteCount: max(bytes, 0))
+            if hasSize {
+                let size = formatter.string(fromByteCount: totalBytes!)
+                let percent = min(100, Int((Double(bytes) / Double(totalBytes!)) * 100))
+                self.detailLabel.stringValue = "(\(min(done + 1, total)) of \(total))  \(label) — \(copied) of \(size) (\(percent)%)"
+            } else {
+                self.detailLabel.stringValue = "(\(min(done + 1, total)) of \(total))  \(label) — \(copied) transferred"
+            }
         }
     }
 

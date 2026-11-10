@@ -84,14 +84,26 @@ Toolchain: Go 1.26 (only for the Plan-B fallback), Xcode CLT (swiftc), `brew ins
 
 7. **Bulk transfer bypasses the mount entirely** — Finder drag-drop through FUSE is ~60×
    slower for many files (per-file process spawn + stat storm + double-copy). The
-   "Send Finder Selection (fast)" menu item runs batched `adb pull -a` / `adb push`
-   (≤16 items per call, cumulative byte progress). adb quirks it depends on:
+   "Send Finder Selection (fast)" menu item runs **batched** (`≤16` items per call) and
+   **parallel** (`maxConcurrent` = 4 adb calls in flight) `adb pull -a` / `adb push`.
+   adb quirks it depends on:
    - Multi-source `adb push` requires the destination dir to EXIST (`ensureRemoteDir`).
    - Push destination must be given WITHOUT a trailing slash: a bare existing dir makes
      directory sources land under their own names (Finder semantics); a trailing slash
      merges a directory's CONTENTS into the dest instead. `adb pull` keeps the slash.
-   - Pre-size phone paths with ONE `adb shell` call: `for f in …; do … du -sk / stat -c %s …; done`
-     with indexed output (missing paths still emit a line, value 0) so the mapping holds.
+   - Pre-size phone paths with ONE `adb shell` call per ≤48 paths; each per-path
+     `du -sk` / `stat -c %s` runs in a background subshell on the device
+     (`( … ) & … ; wait`), so the chunk costs ~one spawn, not one per path. Indexed
+     output (`<i> D|F <bytes>`) keeps the mapping for missing paths (value 0).
+   - Progress is parsed from adb's OWN stderr — it prints `<source>: 1 file
+     pulled/pushed, …` per file even when stderr is a pipe. The incremental stderr
+     reader marks each source done (no extra adb calls, no poll-sleep granularity);
+     a slower partial-byte measurement (local sizes for pulls — free; one remote
+     stat for pushes per second) fills the gaps. The wait loop itself ticks at 0.1 s.
+     NOTE: the progress closure can fire from two threads — keep `lastPolled` locked.
+   - Measured (emulator, 60 files ≈ 16 MB): **0.45 s each direction** (was 2.4 s
+     sequential — the old 0.5 s poll-sleep per batch dominated); 200 MB single file
+     in 0.73 s (~284 MB/s, bandwidth-bound, unchanged by parallelism).
 
 8. **AppKit SIGTERM gotcha (app)**: an accessory app launched from a terminal dies on
    SIGTERM via the default disposition — `applicationWillTerminate` NEVER runs (verified:
@@ -99,17 +111,40 @@ Toolchain: Go 1.26 (only for the Plan-B fallback), Xcode CLT (swiftc), `brew ins
    `execv("/sbin/umount <mountpoint>")`s on SIGTERM/SIGINT/SIGHUP; the daemon's fuse loop
    then sees ENOTCONN and exits. Don't "simplify" this away.
 
+9. **Fast-browsing caches (daemon)** — every browse op used to be a live adb round trip
+   (~100-300 ms on a real device); three layers now absorb them:
+   - **Directory-listing cache**: `adb_readdir` keeps the `ls -la` output in `dirListings`
+     for `DIR_LISTING_TTL` (2 s) keyed like `fileData` (escaped FUSE path). Finder
+     re-lists on focus changes / back-navigation; re-lists within the TTL are free.
+     An EMPTY reply (phone gone) is NOT cached, or files would vanish for 2 s.
+   - **Invalidate on mutation**: every mutating handler calls `invalidateParentListing(path)`
+     (create/flush/truncate/mknod/mkdir/rename(both parents)/rmdir/unlink/utimens) so a
+     listing is re-fetched immediately after a change through the mount. The TTL only
+     bounds staleness for OUT-of-mount changes (camera, media scanner, bulk transfers
+     that bypass the mount — reflected within 2 s).
+   - **Open fast path**: a read-only `adb_open` rides on a fresh (30 s) cached stat from
+     `fileData` and skips its `ls -l -a -d` spawn entirely; write opens still verify live.
+   Note: on the emulator the macOS NFS **kernel dentry cache** absorbs re-lists too, so
+   test these layers by watching the daemon log — fresh fetches log `exec_command:
+   adb shell "ls -l -a …"`; cache hits log nothing new.
+
 ## Modifying the vendored daemon
 
 `vendor/adbfs-rootless/adbfs.cpp` is tracked as plain files (no nested git repo, no
-submodule). The committed version is pure upstream; the working tree carries all our
-changes. After changes, regenerate the patch from the OUTER repo (relative paths so it
-still applies to a fresh clone of upstream):
+submodule). The committed version already contains our changes (pure upstream lives in
+the initial commit `636377f`); `patches/adbfs-rootless-fuse-t.patch` is the cumulative
+diff of the patched file vs that upstream blob, so it still applies to a fresh clone of
+upstream. After changes, regenerate the patch against the upstream blob (relative paths)
+and verify the round-trip:
 ```bash
-git diff --relative=vendor/adbfs-rootless -- vendor/adbfs-rootless/adbfs.cpp > patches/adbfs-rootless-fuse-t.patch
+git diff --relative=vendor/adbfs-rootless 636377f -- vendor/adbfs-rootless/adbfs.cpp > patches/adbfs-rootless-fuse-t.patch
+B=$(mktemp -d) && git show 636377f:vendor/adbfs-rootless/adbfs.cpp > $B/adbfs.cpp \
+  && patch -s $B/adbfs.cpp < patches/adbfs-rootless-fuse-t.patch \
+  && diff $B/adbfs.cpp vendor/adbfs-rootless/adbfs.cpp   # must be empty
 ./build.sh && ./app/build_app.sh                                          # rebuild daemon + app
 ```
-Upstream pin: commit `277c088`. FUSE op registration is in `main()`.
+Upstream pin: commit `277c088` (as committed in the outer repo's initial commit `636377f`).
+FUSE op registration is in `main()`.
 
 ## App source (`app/Sources/`)
 
@@ -119,10 +154,12 @@ Upstream pin: commit `277c088`. FUSE op registration is in `main()`.
 - `MountController.swift` — resolves adb + bundled adbfs, mount/unmount lifecycle
   (passes `-o rootdir=/sdcard`), `isMounted()`, `adopt()` for relaunch re-adoption.
   `mountPoint` is `static` (shared with the signal handler).
-- `DeviceMonitor.swift` — polls `adb devices -l` every 3s with a generation counter
-  (stale results discarded) and an 8 s watchdog kill for hung adb.
-- `BulkTransfer.swift` — Finder selection via osascript, direction classify, batched
-  adb pull/push engine (≤16/call), pre-computed sizes, cumulative progress.
+- `DeviceMonitor.swift` — polls `adb devices -l` every 2s (fast auto-mount/unmount
+  reaction) with a generation counter (stale results discarded) and an 8 s watchdog
+  kill for hung adb.
+- `BulkTransfer.swift` — Finder selection via osascript, direction classify, **parallel**
+  batched adb pull/push engine (≤16 items/call, up to 4 calls in flight), parallel
+  device-side pre-sizing, cumulative progress driven by adb's per-file stderr lines.
 - `ProgressWindow.swift` — cumulative progress + transient "Done" state + cancel.
 - `Notifier.swift` — UNUserNotificationCenter wrapper (request + post).
 
@@ -133,10 +170,14 @@ all sources together and they resolve. Trust the build, not per-file diagnostics
 
 Live verification against an emulator/device with `adb` as ground truth. App lifecycle
 cycles verified live: launch → auto-mount (~3-6 s); `adb kill-server` → auto-unmount
-within one poll → reconnect → auto-remount; SIGTERM/SIGINT/quit → mount + daemon gone.
-Transfer engine verified headless via `tests/dmtest.swift` (compiles the real
-`BulkTransfer` + `MountController` with a CLI `main`): flat files both directions
+within one 2 s poll → reconnect → auto-remount; SIGTERM/SIGINT/quit → mount + daemon
+gone in <1 s. Transfer engine verified headless via `tests/dmtest.swift` (compiles the
+real `BulkTransfer` + `MountController` with a CLI `main`): flat files both directions
 (byte-compared), directories (Finder semantics), missing paths (clean batch error).
+Current benchmark (emulator, 60 files ≈ 16 MB): 0.45 s each direction (was 2.4 s
+before the parallel + stderr-progress engine); 200 MB file in 0.73 s (~284 MB/s).
+Browsing: re-lists within the 2 s daemon TTL (and the kernel dentry cache) are
+instant; a create through the mount invalidates the parent listing immediately.
 
 When changing the daemon, still do the classic pass: mount → create/modify/rename/delete
 a file through the mount → confirm each with `adb shell ls`/`cat` → check `df -h <mount>`
@@ -150,8 +191,10 @@ shows real `/sdcard` space → unmount cleanly (`mount | grep DroidMount` empty)
 - Launch-at-login uses `SMAppService` (macOS 13+); untested for ad-hoc-signed bundles run
   from outside /Applications — register() may need a stable location/identity.
 - Notifications require the user to approve the first-launch permission prompt.
-- Bulk transfer batches are sequential (one adb call at a time); overlapping batches
-  could go faster but complicate progress + error attribution.
+- Bulk transfer runs up to 4 adb calls in flight (`maxConcurrent`); beyond that,
+  more concurrency risks device-side process pressure and muddies error attribution.
+- The 2 s directory-listing TTL means out-of-mount changes (camera, bulk transfer)
+  take up to 2 s to appear in an already-open Finder window.
 
 ## Setup the user must do once
 

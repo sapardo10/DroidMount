@@ -25,9 +25,11 @@ FUSE-T (userspace NFS, no kext)  ──►  Finder volume at ~/DroidMount
   `patches/adbfs-rootless-fuse-t.patch`). The patch adds the `create` handler FUSE-T's
   NFS backend requires, a `statfs` handler (cached 5 s) so the volume reports
   `/sdcard`'s real free space — without it Finder refuses to copy files *into* the phone
-  — and a hybrid read strategy: small reads stream in cheap `dd` range fetches, while
-  large/sequential reads transparently switch to one `adb pull` per file, so browsing a
-  few KB and streaming a 200 MB video are both fast. Read/write by default.
+  — a hybrid read strategy (small reads stream in cheap `dd` range fetches, while
+  large/sequential reads transparently switch to one `adb pull` per file), and short-TTL
+  browse caches (directory listings 2 s, stats 30 s, read-only opens reuse them) so
+  Finder navigation feels instant instead of paying an adb round trip per click.
+  Read/write by default.
 - **FUSE-T** — kext-less FUSE for macOS. No Recovery-mode security downgrade, no reboot.
 - **DroidMount.app** — an `NSStatusItem` agent (no Dock icon) that detects devices,
   **auto-mounts** on connect (toggleable), **auto-unmounts on disconnect**, mounts
@@ -83,9 +85,10 @@ Drag files in/out, edit in place, rename, delete — it all writes straight to t
 Finder drag-drop through the mount is fine for a few files, but slow for hundreds —
 every file is staged to a temp dir and copied twice through the NFS layer. For bulk
 media, use **Send Finder Selection (fast)** in the menu, which bypasses the mount and
-drives `adb pull`/`push` directly. Items are **batched (up to 16 per adb call)**, so
-hundreds of files take a handful of connections instead of one process per file. It
-**auto-detects direction** from what you have selected in Finder:
+drives `adb pull`/`push` directly. Items are **batched (up to 16 per adb call) and run
+up to 4 batches in parallel**, so hundreds of files finish in a few quick connections
+instead of one process per file — with live per-file progress. It **auto-detects
+direction** from what you have selected in Finder:
 
 - **Phone → Mac**: select photos/videos/folders *inside the mounted phone*, then
   **Send Finder Selection (fast)** → choose a Mac folder. Runs batched `adb pull -a`.
@@ -97,7 +100,9 @@ A progress window shows cumulative byte progress (pre-computed up front) with a
 Cancel button and a brief "Done" state on success; a notification is posted when the
 transfer finishes or fails. Measured ~**60× faster** than dragging the same files
 through the mount (60-file test), and 21 mixed-size files (incl. a 10 MB one) copy in
-~1.2 s either direction on a Galaxy S24 / emulator.
+~1.2 s either direction on a Galaxy S24 / emulator. With the parallel engine, a
+60-file / 16 MB job now completes in **~0.45 s either direction** (was ~2.4 s), and a
+single 200 MB file moves in ~0.7 s.
 
 > First use prompts "DroidMount wants to control Finder" — that's how it reads your
 > selection. Approve it once.

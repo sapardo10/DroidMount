@@ -149,11 +149,15 @@ FUSE op registration is in `main()`.
 ## App source (`app/Sources/`)
 
 - `main.swift` — `AppDelegate`, `NSStatusItem`, dynamic menu (toggles, ⌘Q), auto-mount /
-  unmount-blocklist logic, notifications wiring, dynamic phone-folder picker, and
+  unmount-blocklist logic, mount-failure retries (5×10 s — the boot race where adb
+  reports the device before `/sdcard` is ready used to brick the app until replug),
+  notifications wiring, dynamic phone-folder picker, and
   `installSignalCleanup` (the SIGTERM umount handler — see gotcha #8).
 - `MountController.swift` — resolves adb + bundled adbfs, mount/unmount lifecycle
   (passes `-o rootdir=/sdcard`), `isMounted()`, `adopt()` for relaunch re-adoption.
-  `mountPoint` is `static` (shared with the signal handler).
+  Daemon stdout/stderr goes to `~/Library/Logs/DroidMount/daemon.log` (fresh per
+  mount attempt — ground truth for mount failures). `mountPoint` is `static`
+  (shared with the signal handler).
 - `DeviceMonitor.swift` — polls `adb devices -l` every 2s (fast auto-mount/unmount
   reaction) with a generation counter (stale results discarded) and an 8 s watchdog
   kill for hung adb.

@@ -11,6 +11,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastDevices: [Device] = []
     private var lastMountState: MountController.State = .unmounted
     private var adoptInFlight = false
+    /// Consecutive failed mount attempts per serial (boot-race retries).
+    private var mountFailures: [String: Int] = [:]
+    private static let maxMountRetries = 5
 
     // MARK: - Preferences
 
@@ -74,6 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if blockedSerials.contains(dev.serial) {
                 blockedSerials = blockedSerials.filter { $0 != dev.serial }
             }
+            mountFailures[dev.serial] = nil
             if case .mounted(let s) = mounter.state, s == dev.serial {
                 mounter.unmount()   // state handler posts the disconnect notification
             }
@@ -97,6 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         defer { lastMountState = s }
         switch s {
         case .mounted(let serial):
+            mountFailures[serial] = 0
             if !adopting {
                 let name = monitor.devices.first { $0.serial == serial }?.model ?? serial
                 Notifier.shared.post("mounted", title: "DroidMount",
@@ -114,11 +119,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         case .error(let msg):
-            Notifier.shared.post("mount-error", title: "DroidMount: mount failed", message: msg)
+            if case .mounted(let serial) = lastMountState {
+                // Mounted drive dropped underneath us (daemon died) — rare path.
+                let name = monitor.devices.first { $0.serial == serial }?.model ?? serial
+                Notifier.shared.post("disconnected", title: "DroidMount",
+                                     message: "“\(name)” disconnected — drive unmounted.")
+            } else if let serial = lastSerialOfAttempt {
+                // A mount attempt failed. Retry silently while the device is
+                // connected (boot race: adb reports the device before /sdcard is
+                // ready); only notify once the retry budget is exhausted.
+                let n = (mountFailures[serial] ?? 0) + 1
+                mountFailures[serial] = n
+                if n < Self.maxMountRetries {
+                    scheduleMountRetry(serial)
+                } else {
+                    let name = monitor.devices.first { $0.serial == serial }?.model ?? serial
+                    Notifier.shared.post("mount-error", title: "DroidMount: mount failed",
+                                         message: "\(msg) (tried \(n) times). Retry from the menu or reconnect the device.")
+                }
+            } else {
+                // No serial (adb/daemon not found) — nothing to retry.
+                Notifier.shared.post("mount-error", title: "DroidMount: mount failed", message: msg)
+            }
         case .mounting:
             break
         }
         rebuildMenu()
+    }
+
+    /// Serial of the attempt that just ended (nil when the failure is a tooling
+    /// error that never started an attempt for a device).
+    private var lastSerialOfAttempt: String? {
+        if case .mounting(let serial) = lastMountState { return serial }
+        return nil
+    }
+
+    private func scheduleMountRetry(_ serial: String) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self else { return }
+            guard self.monitor.devices.contains(where: { $0.serial == serial }) else { return }
+            if case .error = self.mounter.state { self.mounter.mount(serial: serial) }
+        }
     }
 
     // MARK: - Menu
@@ -217,6 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func mountDevice(_ sender: NSMenuItem) {
         guard let serial = sender.representedObject as? String else { return }
         blockedSerials = blockedSerials.filter { $0 != serial }   // explicit mount wins
+        mountFailures[serial] = 0
         mounter.mount(serial: serial)
     }
 

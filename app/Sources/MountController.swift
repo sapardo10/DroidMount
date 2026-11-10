@@ -83,9 +83,21 @@ final class MountController {
         env["PATH"] = platformTools + ":" + (env["PATH"] ?? "/usr/bin:/bin")
         proc.environment = env
 
-        // Swallow the daemon's chatty stdout/stderr.
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
+        // Log the daemon's stdout/stderr to ~/Library/Logs/DroidMount/daemon.log
+        // (fresh per mount attempt — the daemon logs every adb command it runs,
+        // so this is the ground truth for mount failures).
+        let logDir = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/DroidMount")
+        try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+        let logPath = (logDir as NSString).appendingPathComponent("daemon.log")
+        try? FileManager.default.removeItem(atPath: logPath)
+        FileManager.default.createFile(atPath: logPath, contents: nil)
+        if let log = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
+            proc.standardOutput = log
+            proc.standardError = log
+        } else {
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+        }
 
         proc.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
@@ -115,6 +127,7 @@ final class MountController {
             } else if attempt < 12, self.daemon != nil {
                 self.confirmMount(serial: serial, attempt: attempt + 1)
             } else if self.daemon != nil {
+                self.unmount()   // kill the stuck daemon so a retry can relaunch it
                 self.setState(.error("mount timed out"))
             }
         }
